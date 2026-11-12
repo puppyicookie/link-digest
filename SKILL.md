@@ -41,7 +41,7 @@ agent_created: true
 
 用户明确说了「不用审，直接入库」时，才允许收录完直接发布。
 
-## 五个动作
+## 七个动作
 
 ### 一、收录链接
 
@@ -51,12 +51,15 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py collect "<库目录>"
 
 脚本返回单行 JSON，含 `article_idx` / `title` / `author` / `publish_time` / `raw_content` / `media_dir` / `media_files` / `article_target`。同一链接重复收录会返回 `duplicate: true` 并指向原编号，不重复下载。
 
+判重**按内容 ID**，不按 URL 字符串：小红书的 `/explore/<id>` 与 `/discovery/item/<id>` 视为同一篇，`xsec_token` 不同也算重复；B站认 BV 号、小宇宙认 episode id、公众号认 `__biz+mid+idx`。
+
 拿到结果后：
 
 1. 读 `raw_content`（`素材/<n> <标题>/原文.md`）
 2. `media_files` 非空且图片承载正文（教程长图、步骤截图）时，逐张识读图片文字
 3. 按 `references/article-spec.md` 撰写文章，写到 `article_target`（`文章/<n> <短标题>.md`）
-4. 失败（`ok: false`）如实报告并跳过这一条，不编造文章，不中断同批其他链接
+4. **文章标题定了之后跑一次 `retitle`**（见「三、改名」），把素材目录、文件名、引用、台账全部对齐。`collect` 时只能用**原文标题**给素材目录命名，而文章标题是你读完正文后才定的，两边必然分叉——不 retitle 就会留下「文章叫 A、目录叫 B」的脏数据
+5. 失败（`ok: false`）如实报告并跳过这一条，不编造文章，不中断同批其他链接
 
 多条链接逐条串行处理，最后汇总「已收录 X 篇，编号 a~b」，失败的单独列出。
 
@@ -69,7 +72,38 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py collect "<库目录>"
 
 `文章/` 为空时直接回「还没有收录任何文章」，不生成空总结。
 
-### 三、重建索引
+### 三、改名（retitle）
+
+```bash
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py retitle "<库目录>" <编号> "<新标题>"
+```
+
+一条命令做完五件事：改素材目录名、改文章文件名、改 frontmatter 的 `标题` 和 `素材目录`、重写正文里全部 `![[素材/…]]` 图片嵌入、同步台账的 `article_title` 与原文路径。
+
+**用在什么时候**：文章标题与原文标题不一致时（几乎每次都是）。返回的 `broken_images` 必须为空，非空说明有引用没跟上，要查。
+
+不要手写脚本改文件名——以前这么干过两次，每次都要手动盯 17 张图的路径。
+
+### 四、体检（check）
+
+```bash
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py check "<库目录>"
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py check "<库目录>" --links   # 额外测原文链接是否还活着（慢，联网）
+```
+
+输出 `passed` / `errors` / `warnings` / `vault_orphans` / `dead_links` / `stats.uncovered_articles`。检查项：
+
+- 编号是否跳号
+- frontmatter 必填字段、正文首行 H1
+- 图片引用是否都指向真实文件
+- 文章文件名与素材目录名的标题片段是否一致
+- 台账条目与磁盘是否对得上
+- 总结声称覆盖的文章是否存在、哪些文章还没进任何总结
+- vault 里有没有库里已不存在的孤儿文件
+
+**每次收录完、每次发布前跑一次。** `errors` 非空就不要交付。`uncovered_articles` 非空时顺口告诉用户「3、4 号还没进总结」。
+
+### 五、重建索引
 
 ```bash
 python ~/.workbuddy/skills/link-digest/scripts/render.py index "<库目录>"
@@ -77,7 +111,7 @@ python ~/.workbuddy/skills/link-digest/scripts/render.py index "<库目录>"
 
 生成 `index.html`：单文件、离线可看，点卡片展开全文。**每次写完文章或总结都跑一次**，保持索引是最新的。
 
-### 四、查看状态
+### 六、查看状态
 
 ```bash
 python ~/.workbuddy/skills/link-digest/scripts/pipeline.py status "<库目录>"
@@ -86,7 +120,7 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py libraries "<父目录
 
 用表格回：编号 / 标题 / 平台 / 作者 / 收录时间，并说明已有几份总结、各自覆盖了哪些文章。
 
-### 五、发布到 Obsidian
+### 七、发布到 Obsidian
 
 **只在用户确认之后执行。**
 
@@ -96,10 +130,10 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py publish "<库目录>"
 
 - 复制 `文章/`、`总结/`、`素材/`（含图片）到 vault，跳过内部文件（`.ledger.json`、`meta.md`、`_source/`），并重建 vault 里的 `index.html`
 - `--vault` 只需第一次带，之后记在库的 `.config.json` 里；目标目录变了才需要重新指定
-- **publish 只增改不删除**：库里重命名或删除文件后，vault 里会留下旧名字的文件，发布前要手动把 vault 里的旧文件清掉，避免 Obsidian 里出现两份
+- **孤儿文件**：库里改名或删掉的文件，vault 里不会自动消失，会在返回的 `orphans` 里列出。加 `--prune` 才会删除（删集合永远需要显式开关）。改名之后发布，务必带 `--prune`，否则 Obsidian 里会同时出现新旧两份
 - **冲突保护**：vault 里的同名文件若比库里新（用户在 Obsidian 里改过），跳过并在 `conflicts` 里列出。这种情况**必须口头告诉用户哪几个文件没覆盖**，并问是保留 Obsidian 版本还是以库为准
 - 想先看会改动什么，加 `--dry-run`
-- 发布后用一句话回报：复制了几个文件、有没有冲突。不复述全部路径
+- 发布后用一句话回报：复制了几个文件、有没有冲突、清掉几个残留。不复述全部路径
 
 库仍是唯一事实来源，vault 是阅读端。用户如果在 Obsidian 里改错了，从库里重新 copy 一份覆盖即可。
 
@@ -113,7 +147,8 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py init "<库目录>"
 
 ## 交付
 
-- 每完成一次收录或总结，跑一次索引重建，然后用 `present_files` 展示**刚生成的那份文档**；新建库时额外把 `index.html` 一起展示
+- 每完成一次收录或总结，先跑 `check`，再跑一次索引重建，然后用 `present_files` 展示**刚生成的那份文档**；新建库时额外把 `index.html` 一起展示
+- `check` 有 `errors` 就不要交付，先修
 - 回复里给：编号 + 标题 + 一句话说明，以及下一步能做什么（「再说一次总结就出 2 号」）
 - 总结交付时把「等你确认后我入库」说出口，让用户知道现在还差一步
 - 路径用绝对路径
@@ -127,3 +162,8 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py init "<库目录>"
 - 版权归原作者，原创内容仅作个人归档，不用于二次发布
 - 不覆盖已有文件：目标编号已存在时重新取号，绝不覆盖
 - 未经用户确认不执行 `publish`；`publish` 也绝不覆盖 Obsidian 里比库更新的文件
+- 只有带 `--prune` 才会删除 vault 里的文件，默认只报告
+
+## 已知待定
+
+**全量总结的上下文上限**。当前规则是「每次总结读全部文章」，2~10 篇没问题，到 30 篇左右模型上下文会装不下，那时要么报错、要么悄悄只读前几篇（后者更糟）。三个候选方案：分层出底稿、文章生成时写 150 字摘要供总结只读摘要、库超过 20 篇就建议分库。**等库真正到 20 篇再定**，现在改等于猜。

@@ -57,20 +57,37 @@ python scripts/pipeline.py init ~/文章库
 # 收录一条链接（返回 JSON，含编号、标题、素材路径）
 python scripts/pipeline.py collect ~/文章库 "<链接>"
 
+# 改文章标题：联动素材目录名、文件名、frontmatter、图片引用、台账
+python scripts/pipeline.py retitle ~/文章库 3 "新的文章标题"
+
 # 取下一个可用编号
 python scripts/pipeline.py next ~/文章库 --type article    # 或 --type summary
 
 # 看现在收了多少
 python scripts/pipeline.py status ~/文章库
 
+# 体检：图片、编号、台账、总结覆盖范围、vault 孤儿文件
+python scripts/pipeline.py check ~/文章库
+python scripts/pipeline.py check ~/文章库 --links          # 额外测原文链接是否还活着
+
 # 生成可离线阅读的索引页
 python scripts/render.py index ~/文章库
 
-# 发布到 Obsidian（带冲突保护）
-python scripts/pipeline.py publish ~/文章库 --vault ~/Obsidian/文章库
+# 发布到 Obsidian（带冲突保护；--prune 清掉改名留下的残留）
+python scripts/pipeline.py publish ~/文章库 --vault ~/Obsidian/文章库 --prune
 ```
 
 脚本只负责采集、落盘、编号。正文文章和总结由模型按 `references/` 里的规范撰写——这部分是判断和写作，硬编码不出来。
+
+## 判重按内容 ID，不按链接字符串
+
+同一条内容有好几种写法：小红书的 `/explore/<id>` 和 `/discovery/item/<id>` 是同一篇，分享参数 `xsec_token` 每次都不同。所以重复判定用「平台 + 内容 ID」：小红书认 24 位笔记 ID，B站认 BV 号，小宇宙认 episode id，公众号认 `__biz + mid + idx`。同一条链接收两次会被识别出来并指向原编号，不会重复下载图片。
+
+## 改名为什么要专门一条命令
+
+`collect` 时只能用**原文标题**给素材目录命名，但文章标题是模型读完正文之后才定的——「期末考高速通过 纯用ai搞定复习大纲＋刷题」会变成「用 NotebookLM + Gemini 两天搞定微观经济学期末复习」。两边必然分叉。
+
+`retitle` 一条命令做完全部联动：素材目录改名、文章文件改名、frontmatter 的 `标题` 与 `素材目录`、正文里全部 `![[素材/…]]` 图片嵌入、台账记录。返回的 `broken_images` 必须为空。
 
 ## 三条硬规则
 
@@ -91,6 +108,7 @@ python scripts/pipeline.py publish ~/文章库 --vault ~/Obsidian/文章库
 - **评论区抓不到**。评论走独立接口且需要 `x-s` / `x-s-common` 签名，SSR 里是空数组，纯请求链路无解，需要真实浏览器控制通道
 - 公众号没有专用提取器，是 best-effort 解析，失败会明确报错而不是生成空文章
 - 内容版权归原作者，仅作个人归档，不用于二次发布
+- **全量总结有上下文上限**。当前规则是每次总结都读全部文章，2~10 篇没问题，30 篇左右模型上下文会装不下。这一步还没解决，届时要么改成「每 10 篇出一份底稿再汇总」，要么按主题分库
 
 ## License
 

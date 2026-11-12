@@ -5,10 +5,12 @@ link-digest 工作区管理 + 内容采集。
 子命令:
     init    <项目目录>                     建目录骨架（文章/ 总结/ 素材/）
     collect <项目目录> <链接>              采集链接 → 素材/<n>/，并追加 ledger
+    retitle <项目目录> <编号> <新标题>      把文章改成新标题，并联动素材目录、图片引用、ledger
     next    <项目目录> --type article|summary   输出下一个可用编号
     status  <项目目录>                     输出当前收录情况
+    check   <项目目录> [--vault <路径>] [--links]   体检：图片、编号、台账、覆盖范围、孤儿文件
     libraries <父目录>                    列出该目录下的所有库
-    publish <项目目录> --vault <路径>       把库里内容镜像到 Obsidian（含冲突保护）
+    publish <项目目录> --vault <路径> [--prune] [--dry-run]  镜像到 Obsidian（含冲突保护）
 
 设计约定:
     - 文章/总结采用「分开编号」：文章/1.md、2.md…；总结/1.md、2.md…
@@ -269,8 +271,81 @@ def cmd_status(args):
 
 
 def canon(url):
-    """去参数做重复判定：同一条笔记的分享链接 xsec_token 每次都不同。"""
-    return re.sub(r'[?#].*$', '', url.strip()).rstrip('/')
+    """归一化成判重 key。
+
+    同一条内容会有多种写法：小红书 /explore/<id> 与 /discovery/item/<id> 是同一篇，
+    分享参数 xsec_token 每次都不同。所以按「平台 + 内容 ID」判重，不按 URL 字符串。
+    """
+    u = (url or '').strip()
+    low = u.lower()
+    if 'xiaohongshu.com' in low or 'xhslink.com' in low:
+        m = re.search(r'/(?:explore|discovery/item|item|note)/([0-9a-z]{20,32})', low)
+        if m:
+            return 'xhs:' + m.group(1)
+    if 'bilibili.com' in low or 'b23.tv' in low:
+        m = re.search(r'(bv[0-9a-z]{10})', low)
+        if m:
+            return 'bili:' + m.group(1)
+        m = re.search(r'/av(\d+)', low)
+        if m:
+            return 'bili:av' + m.group(1)
+    if 'xiaoyuzhoufm.com' in low:
+        m = re.search(r'/episode/([0-9a-z]+)', low)
+        if m:
+            return 'xyz:' + m.group(1)
+    if 'mp.weixin.qq.com' in low:
+        from urllib.parse import urlparse, parse_qs
+        q = parse_qs(urlparse(u).query)
+        biz = (q.get('__biz') or [''])[0]
+        mid = (q.get('mid') or [''])[0]
+        idx = (q.get('idx') or [''])[0]
+        if biz or mid:
+            return 'wx:%s:%s:%s' % (biz, mid, idx)
+    return re.sub(r'[?#].*$', '', u).rstrip('/')
+
+
+def numbered_file(d, idx):
+    """在目录里按编号找文件，兼容 1.md 与 1 标题.md。"""
+    if not os.path.isdir(d):
+        return None
+    for f in sorted(os.listdir(d)):
+        m = re.match(r'^%s' % NUM_RE, f)
+        if m and int(m.group(1)) == idx:
+            return os.path.join(d, f)
+    return None
+
+
+def article_file(project, idx):
+    return numbered_file(os.path.join(project, '文章'), idx)
+
+
+def material_dir(project, idx):
+    """按编号找素材目录，兼容 1/ 与 1 标题/。"""
+    d = os.path.join(project, '素材')
+    if not os.path.isdir(d):
+        return None
+    for name in sorted(os.listdir(d)):
+        m = re.match(r'^(\d+)(?:[ .].*)?$', name)
+        if m and int(m.group(1)) == idx and os.path.isdir(os.path.join(d, name)):
+            return os.path.join(d, name)
+    return None
+
+
+def split_fm(text):
+    """拆 frontmatter，返回 (dict, 正文)。只认顶层 key: value 与 "- " 列表项。"""
+    m = re.match(r'^---\s*\n(.*?)\n---\s*\n', text, re.S)
+    if not m:
+        return {}, text
+    fm = {}
+    for line in m.group(1).splitlines():
+        if ':' in line and not line.startswith(' '):
+            k, v = line.split(':', 1)
+            fm[k.strip()] = v.strip()
+        elif line.strip().startswith('- ') and fm:
+            k = list(fm.keys())[-1]
+            fm[k] = (fm[k] + ' ' if fm[k] else '') + line.strip()[2:]
+    return fm, text[m.end():]
+
 
 
 def cmd_libraries(args):
@@ -289,6 +364,219 @@ def cmd_libraries(args):
     out({'ok': True, 'root': root, 'libraries': libs})
 
 
+def cmd_retitle(args):
+    """把文章改成新标题，并联动：素材目录名、frontmatter、图片引用、文件名、ledger。
+
+    为什么要这条：collect 时只能用原文标题给素材目录命名，而文章标题是模型读完
+    正文后才定的，两边必然分叉。以前靠手写一次性脚本改，漏一处图片就裂。
+    """
+    if len(args) < 3:
+        fail('用法: retitle <项目目录> <编号> <新标题>')
+    project = os.path.abspath(args[0])
+    try:
+        idx = int(args[1])
+    except ValueError:
+        fail('编号必须是数字')
+    title = ' '.join(args[2:]).strip()
+    slug = safe_title(title)
+    if not slug:
+        fail('标题为空，或清洗 Windows 禁用字符后为空')
+
+    art = article_file(project, idx)
+    if not art:
+        fail('文章 %d 不存在' % idx)
+
+    mdir = material_dir(project, idx)
+    old_dir = os.path.basename(mdir) if mdir else ''
+    new_dir = '%d %s' % (idx, slug)
+    changes = []
+
+    if mdir and old_dir != new_dir:
+        new_mdir = os.path.join(os.path.dirname(mdir), new_dir)
+        if os.path.exists(new_mdir):
+            fail('目标目录已存在，未改动任何文件: %s' % new_mdir)
+        os.rename(mdir, new_mdir)
+        changes.append('素材/%s → 素材/%s' % (old_dir, new_dir))
+        mdir = new_mdir
+
+    raw = open(art, 'rb').read().decode('utf-8')
+    crlf = '\r\n' in raw
+    text = raw.replace('\r\n', '\n')
+    head, body = '', text
+    m = re.match(r'^(---\s*\n.*?\n---\s*\n)', text, re.S)
+    if m:
+        head, body = m.group(1), text[m.end():]
+    head = re.sub(r'(?m)^标题:.*$', '标题: ' + title, head, count=1)
+    head = re.sub(r'(?m)^素材目录:.*$', '素材目录: 素材/' + new_dir, head, count=1)
+    if re.search(r'(?m)^#\s+', body):
+        body = re.sub(r'(?m)^#\s+.*$', lambda _: '# ' + title, body, count=1)
+    else:
+        body = '# %s\n\n' % title + body
+
+    if old_dir and old_dir != new_dir:
+        head = head.replace('素材/%s/' % old_dir, '素材/%s/' % new_dir)
+        body = body.replace('素材/%s/' % old_dir, '素材/%s/' % new_dir)
+        body = body.replace('../素材/%s/' % old_dir, '素材/%s/' % new_dir)
+
+    new_text = head + body
+    if crlf:
+        new_text = new_text.replace('\n', '\r\n')
+
+    def write_back(path):
+        # newline='' 关掉自动转换，保留文件原本的行尾，避免整篇看起来被重写
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            f.write(new_text)
+
+    new_art = os.path.join(os.path.dirname(art), '%d %s.md' % (idx, slug))
+    if os.path.abspath(new_art) != os.path.abspath(art):
+        if os.path.exists(new_art):
+            fail('目标文件已存在，未改动: %s' % new_art)
+        write_back(new_art)
+        os.remove(art)
+        changes.append('文章/%s → 文章/%s' % (os.path.basename(art),
+                                            os.path.basename(new_art)))
+    else:
+        write_back(art)
+
+    ledger = load_ledger(project)
+    for e in ledger:
+        if e.get('idx') == idx:
+            e['article_title'] = title
+            if mdir:
+                e['content'] = os.path.relpath(
+                    os.path.join(mdir, '原文.md'), project).replace('\\', '/')
+    if ledger:
+        json.dump(ledger, open(os.path.join(project, '.ledger.json'), 'w',
+                               encoding='utf-8'), ensure_ascii=False, indent=2)
+
+    imgs = 0
+    if mdir and os.path.isdir(os.path.join(mdir, 'media')):
+        imgs = len([f for f in os.listdir(os.path.join(mdir, 'media'))
+                    if os.path.isfile(os.path.join(mdir, 'media', f))])
+    broken = [r for r in re.findall(r'!\[\[([^\]|]+)', new_text)
+              if not os.path.exists(os.path.join(project, *r.strip().split('/')))]
+    out({'ok': True, 'article_idx': idx, 'title': title, 'slug': slug,
+         'article': new_art, 'material_dir': mdir or '',
+         'changes': changes or ['无变化（标题已一致）'],
+         'media_count': imgs, 'broken_images': broken})
+
+
+def cmd_check(args):
+    """体检：把「应该没问题」换成一份可核对的问题清单。"""
+    project, vault, test_links = None, None, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--vault':
+            vault = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if a == '--links':
+            test_links = True
+        elif not a.startswith('--') and project is None:
+            project = a
+        i += 1
+    if not project:
+        fail('用法: check <项目目录> [--vault <路径>] [--links]')
+    project = os.path.abspath(project)
+
+    errors, warns = [], []
+    arts = numbered(os.path.join(project, '文章'))
+    sums = numbered(os.path.join(project, '总结'))
+    ledger = load_ledger(project)
+
+    for label, nums in (('文章', arts), ('总结', sums)):
+        if nums:
+            miss = [n for n in range(1, max(nums) + 1) if n not in nums]
+            if miss:
+                errors.append('%s编号跳号：缺 %s' % (label, ','.join(map(str, miss))))
+
+    for n in arts:
+        p = article_file(project, n)
+        text = open(p, encoding='utf-8').read()
+        fm, body = split_fm(text)
+        name = os.path.basename(p)
+        if not fm.get('标题'):
+            errors.append('文章 %d 缺 frontmatter「标题」（%s）' % (n, name))
+        if not re.search(r'(?m)^#\s+\S', body):
+            warns.append('文章 %d 正文没有首行 H1（Obsidian 里认不出）' % n)
+        mdir = material_dir(project, n)
+        if not mdir:
+            errors.append('文章 %d 找不到对应的素材目录' % n)
+        else:
+            a_slug = re.sub(r'^%d[ .]?' % n, '', name[:-3])
+            d_slug = re.sub(r'^%d[ .]?' % n, '', os.path.basename(mdir))
+            if a_slug and d_slug and a_slug != d_slug:
+                warns.append('文章与素材标题片段不一致：「%s」vs「%s」（用 retitle 对齐）'
+                             % (a_slug, d_slug))
+            if not os.path.exists(os.path.join(mdir, '原文.md')):
+                warns.append('素材 %d 缺 原文.md' % n)
+        refs = re.findall(r'!\[\[([^\]|]+)', text) + \
+            re.findall(r'!\[[^\]]*\]\(([^)]+)\)', text)
+        for ref in refs:
+            t = ref.strip().replace('\\', '/')
+            while t.startswith('../'):
+                t = t[3:]
+            if not os.path.exists(os.path.join(project, *t.split('/'))):
+                errors.append('文章 %d 图片找不到: %s' % (n, ref.strip()))
+
+    led_idxs = set()
+    for e in ledger:
+        k = e.get('idx')
+        led_idxs.add(k)
+        if k not in arts:
+            errors.append('台账第 %s 条在磁盘上没有对应文章' % k)
+        c = e.get('content') or ''
+        if not c or not os.path.exists(os.path.join(project, *c.split('/'))):
+            errors.append('台账第 %s 条原文路径无效: %s' % (k, c))
+        if not e.get('url'):
+            warns.append('台账第 %s 条缺原文链接' % k)
+    for n in arts:
+        if n not in led_idxs:
+            warns.append('文章 %d 不在台账里（手写的？）' % n)
+
+    covered = set()
+    for m_ in sums:
+        sp = numbered_file(os.path.join(project, '总结'), m_)
+        fm, _ = split_fm(open(sp, encoding='utf-8').read())
+        nums = [int(x) for x in re.findall(r'\d+', fm.get('覆盖文章', ''))]
+        if not nums:
+            warns.append('总结 %d 缺「覆盖文章」字段，无法判断覆盖范围' % m_)
+        for x in nums:
+            covered.add(x)
+            if x not in arts:
+                errors.append('总结 %d 声称覆盖文章 %d，但该文章不存在' % (m_, x))
+    uncovered = [n for n in arts if n not in covered]
+
+    cfg = load_cfg(project)
+    target = vault or cfg.get('vault')
+    orphans = []
+    if target and os.path.isdir(target):
+        lib_rel = set(rel for rel, _ in iter_payload(project))
+        orphans = sorted(r for r in vault_files(target) if r not in lib_rel)
+
+    dead = []
+    if test_links:
+        for e in ledger:
+            u = e.get('url')
+            if not u:
+                continue
+            r = subprocess.run(['curl', '-sL', '-o', '/dev/null', '-w', '%{http_code}',
+                                '--max-time', '12', '-A', UA, u],
+                               capture_output=True, text=True)
+            code = (r.stdout or '').strip()
+            if not code.startswith('2'):
+                dead.append({'article_idx': e.get('idx'), 'status': code, 'url': u})
+                warns.append('文章 %s 原文链接可能失效（HTTP %s）' % (e.get('idx'), code))
+
+    out({'ok': True, 'passed': not errors, 'project': project,
+         'stats': {'articles': len(arts), 'summaries': len(sums),
+                   'ledger': len(ledger), 'uncovered_articles': uncovered},
+         'errors': errors, 'warnings': warns,
+         'vault': target or '', 'vault_orphans': orphans, 'dead_links': dead})
+
+
+
 def cmd_collect(args):
     if len(args) < 2:
         fail('用法: collect <项目目录> <链接>')
@@ -304,11 +592,19 @@ def cmd_collect(args):
     ledger = load_ledger(project)
     for e in ledger:
         if canon(e.get('url', '')) == canon(url):
-            out({'ok': True, 'duplicate': True, 'article_idx': e.get('idx'),
+            idx = e.get('idx')
+            art = article_file(project, idx)
+            mdir = material_dir(project, idx)
+            files = []
+            if mdir and os.path.isdir(os.path.join(mdir, 'media')):
+                files = sorted(os.listdir(os.path.join(mdir, 'media')))
+            out({'ok': True, 'duplicate': True, 'article_idx': idx,
                  'platform': e.get('platform'), 'title': e.get('title'),
                  'author': e.get('author'), 'publish_time': e.get('publish_time'),
                  'raw_content': os.path.join(project, *e.get('content', '').split('/')),
-                 'article_target': os.path.join(project, '文章', '%s.md' % e.get('idx')),
+                 'article_target': art,
+                 'article_exists': bool(art),
+                 'media_dir': mdir or '', 'media_count': len(files),
                  'note': '该链接已收录，未重复下载'})
 
     incoming = os.path.join(project, '.incoming', datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'))
@@ -404,12 +700,47 @@ def iter_payload(project):
                 yield os.path.relpath(src, project).replace('\\', '/'), src
 
 
+def same_content(a, b):
+    """两个文件内容是否等价。
+
+    只比字节会把「CRLF vs LF」误判成改动：Windows 上写文件默认 CRLF，
+    库和 vault 因此可能字节数不同而内容一致。文本文件按归一化行尾比较。
+    """
+    try:
+        ba = open(a, 'rb').read()
+        bb = open(b, 'rb').read()
+    except OSError:
+        return False
+    if ba == bb:
+        return True
+    if os.path.splitext(a)[1].lower() in ('.md', '.txt', '.html', '.htm', '.json', '.csv'):
+        return ba.replace(b'\r\n', b'\n') == bb.replace(b'\r\n', b'\n')
+    return False
+
+
+def vault_files(target):
+    """列出 vault 里属于镜像范围的文件（相对路径，斜杠统一）。"""
+    res = []
+    for sub in ('文章', '总结', '素材'):
+        base = os.path.join(target, sub)
+        if not os.path.isdir(base):
+            continue
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith('.') and d != '_source']
+            for f in files:
+                if f.startswith('.') or f == 'meta.md':
+                    continue
+                res.append(os.path.relpath(os.path.join(root, f), target)
+                           .replace('\\', '/'))
+    return res
+
+
 def cmd_publish(args):
     """把库内容镜像到 Obsidian vault（复制，不改动源库）。
 
     冲突保护：vault 里的同名文件若比库里新（你手动改过），跳过并报告，绝不覆盖。
     """
-    project, vault, dry = None, None, False
+    project, vault, dry, prune = None, None, False, False
     i = 0
     while i < len(args):
         a = args[i]
@@ -419,11 +750,13 @@ def cmd_publish(args):
             continue
         if a == '--dry-run':
             dry = True
+        elif a == '--prune':
+            prune = True
         elif not a.startswith('--') and project is None:
             project = a
         i += 1
     if not project:
-        fail('用法: publish <项目目录> --vault <Obsidian 目标目录> [--dry-run]')
+        fail('用法: publish <项目目录> --vault <Obsidian 目标目录> [--prune] [--dry-run]')
     project = os.path.abspath(project)
     ensure_project(project)
 
@@ -439,16 +772,20 @@ def cmd_publish(args):
     if target.startswith(project + os.sep):
         fail('vault 目录不能放在库目录内部')
 
+    payload = list(iter_payload(project))
+    lib_rel = set(rel for rel, _ in payload)
+
     copied, same, conflicts = 0, 0, []
-    for rel, src in iter_payload(project):
+    for rel, src in payload:
         dst = os.path.join(target, *rel.split('/'))
         if os.path.exists(dst):
             try:
+                # 内容一致就算没变，不管 mtime：库被重写过但内容没动的情况很多
+                if same_content(dst, src):
+                    same += 1
+                    continue
                 if os.path.getmtime(dst) > os.path.getmtime(src) + 1:
                     conflicts.append(rel)
-                    continue
-                if abs(os.path.getmtime(dst) - os.path.getmtime(src)) <= 1:
-                    same += 1
                     continue
             except OSError:
                 pass
@@ -456,6 +793,32 @@ def cmd_publish(args):
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copy2(src, dst)
         copied += 1
+
+    orphans = sorted(r for r in vault_files(target) if r not in lib_rel) \
+        if os.path.isdir(target) else []
+    pruned = []
+    if prune:
+        for rel in orphans:
+            if dry:
+                pruned.append(rel)
+                continue
+            p = os.path.join(target, *rel.split('/'))
+            try:
+                os.remove(p)
+                pruned.append(rel)
+            except OSError:
+                pass
+        if not dry:
+            for sub in ('文章', '总结', '素材'):
+                base = os.path.join(target, sub)
+                if not os.path.isdir(base):
+                    continue
+                for root, dirs, files in os.walk(base, topdown=False):
+                    if not os.listdir(root):
+                        try:
+                            os.rmdir(root)
+                        except OSError:
+                            pass
 
     if not dry:
         cfg['vault'] = target
@@ -468,7 +831,11 @@ def cmd_publish(args):
 
     out({'ok': True, 'dry_run': dry, 'vault': target,
          'copied': copied, 'unchanged': same, 'conflicts': conflicts,
-         'conflict_note': '这些文件在 Obsidian 里被改过，未覆盖' if conflicts else ''})
+         'conflict_note': '这些文件在 Obsidian 里被改过，未覆盖' if conflicts else '',
+         'orphans': [r for r in orphans if r not in pruned],
+         'pruned': pruned,
+         'orphan_note': ('有 %d 个文件在库里已不存在（改名或删除的残留）'
+                         '，加 --prune 可清掉' % len(orphans)) if orphans and not prune else ''})
 
 
 def main():
@@ -476,11 +843,12 @@ def main():
         print(__doc__)
         sys.exit(1)
     cmd, args = sys.argv[1], sys.argv[2:]
-    handler = {'init': cmd_init, 'collect': cmd_collect, 'next': cmd_next,
-               'status': cmd_status, 'libraries': cmd_libraries,
-               'publish': cmd_publish}.get(cmd)
+    handler = {'init': cmd_init, 'collect': cmd_collect, 'retitle': cmd_retitle,
+               'next': cmd_next, 'status': cmd_status, 'check': cmd_check,
+               'libraries': cmd_libraries, 'publish': cmd_publish}.get(cmd)
     if not handler:
-        fail('未知子命令: %s（可用 init/collect/next/status/libraries/publish）' % cmd)
+        fail('未知子命令: %s（可用 init/collect/retitle/next/status/check/libraries/publish）'
+             % cmd)
     handler(args)
 
 
