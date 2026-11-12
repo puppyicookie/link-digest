@@ -569,6 +569,20 @@ def cmd_check(args):
                 dead.append({'article_idx': e.get('idx'), 'status': code, 'url': u})
                 warns.append('文章 %s 原文链接可能失效（HTTP %s）' % (e.get('idx'), code))
 
+    moc = os.path.join(project, '00-目录.md')
+    if not os.path.exists(moc):
+        warns.append('缺 00-目录.md（Obsidian 入口），跑一次 render.py moc 生成')
+    else:
+        newest = 0
+        for sub in ('文章', '总结'):
+            d = os.path.join(project, sub)
+            if os.path.isdir(d):
+                for f in os.listdir(d):
+                    if f.endswith('.md'):
+                        newest = max(newest, os.path.getmtime(os.path.join(d, f)))
+        if newest > os.path.getmtime(moc) + 1:
+            warns.append('00-目录.md 比文章/总结旧，可能已过期，重跑 render.py moc')
+
     out({'ok': True, 'passed': not errors, 'project': project,
          'stats': {'articles': len(arts), 'summaries': len(sums),
                    'ledger': len(ledger), 'uncovered_articles': uncovered},
@@ -698,6 +712,11 @@ def iter_payload(project):
                     continue
                 src = os.path.join(root, f)
                 yield os.path.relpath(src, project).replace('\\', '/'), src
+    # 库根目录的笔记（00-目录.md、用户自己的备注）也一并镜像
+    for f in sorted(os.listdir(project)):
+        p = os.path.join(project, f)
+        if os.path.isfile(p) and f.endswith('.md') and not f.startswith('.'):
+            yield f, p
 
 
 def same_content(a, b):
@@ -732,6 +751,10 @@ def vault_files(target):
                     continue
                 res.append(os.path.relpath(os.path.join(root, f), target)
                            .replace('\\', '/'))
+    for f in sorted(os.listdir(target)):
+        p = os.path.join(target, f)
+        if os.path.isfile(p) and f.endswith('.md') and not f.startswith('.'):
+            res.append(f)
     return res
 
 
@@ -771,6 +794,13 @@ def cmd_publish(args):
         fail('vault 目录与库目录相同，无需发布')
     if target.startswith(project + os.sep):
         fail('vault 目录不能放在库目录内部')
+
+    render = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'render.py')
+    if os.path.exists(render) and not dry:
+        # 目录在「库里」生成，然后作为普通文件镜像过去；
+        # 若在 vault 里再生成一次，时间戳会不同，下一轮就变成假冲突
+        subprocess.run([sys.executable, render, 'moc', project],
+                       capture_output=True, text=True)
 
     payload = list(iter_payload(project))
     lib_rel = set(rel for rel, _ in payload)
@@ -824,7 +854,6 @@ def cmd_publish(args):
         cfg['vault'] = target
         cfg['last_publish'] = now()
         save_cfg(project, cfg)
-        render = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'render.py')
         if os.path.exists(render):
             subprocess.run([sys.executable, render, 'index', target],
                            capture_output=True, text=True)

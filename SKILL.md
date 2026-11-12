@@ -20,7 +20,8 @@ agent_created: true
 ├── 总结/        1 标题.md, 2 标题.md…        全量总结，每次一份新文档
 ├── 素材/        1 标题/, 2 标题/             原文留底 + 图片（与文章同号）
 │   └── <n> 标题/   原文.md  meta.md  media/  _source/
-├── index.html                                文章与总结的可翻阅网页
+├── 00-目录.md                                Obsidian 入口：双链 + 一句话 + 待总结提示（自动生成）
+├── index.html                                文章与总结的可翻阅网页（自动生成）
 └── .ledger.json                              收录台账
 ```
 
@@ -103,13 +104,20 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py check "<库目录>" -
 
 **每次收录完、每次发布前跑一次。** `errors` 非空就不要交付。`uncovered_articles` 非空时顺口告诉用户「3、4 号还没进总结」。
 
-### 五、重建索引
+### 五、生成索引与目录
 
 ```bash
-python ~/.workbuddy/skills/link-digest/scripts/render.py index "<库目录>"
+python ~/.workbuddy/skills/link-digest/scripts/render.py all "<库目录>"    # 两个都生成
+python ~/.workbuddy/skills/link-digest/scripts/render.py index "<库目录>"  # 只要网页
+python ~/.workbuddy/skills/link-digest/scripts/render.py moc "<库目录>"    # 只要 00-目录.md
 ```
 
-生成 `index.html`：单文件、离线可看，点卡片展开全文。**每次写完文章或总结都跑一次**，保持索引是最新的。
+两个产物，用途不同：
+
+- **`index.html`** —— 单文件网页，点卡片展开全文。发链接给别人、或手机上打开用。**在 Obsidian 里没用**（Obsidian 不渲染 html）。
+- **`00-目录.md`** —— Obsidian 里的入口。`[[文章/…]]`、`[[总结/…]]` 双链，每篇带平台/作者/时间 + 一句话摘要，末尾有 `## 待总结` 列出还没进任何总结的文章。**每次写完文章或总结都要重跑**，否则目录会旧。
+
+`00-目录.md` 只写日期不写时刻，同一天重复生成结果完全一致——这样 publish 不会因为时间戳变化产生假改动。
 
 ### 六、查看状态
 
@@ -128,7 +136,8 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py libraries "<父目录
 python ~/.workbuddy/skills/link-digest/scripts/pipeline.py publish "<库目录>" --vault "D:/Obsidian/文章库"
 ```
 
-- 复制 `文章/`、`总结/`、`素材/`（含图片）到 vault，跳过内部文件（`.ledger.json`、`meta.md`、`_source/`），并重建 vault 里的 `index.html`
+- 复制 `文章/`、`总结/`、`素材/`（含图片）和库根目录的 `.md`（含 `00-目录.md`）到 vault，跳过内部文件（`.ledger.json`、`meta.md`、`_source/`），并重建 vault 里的 `index.html`
+- 发布前会先在**库里**重新生成 `00-目录.md` 再镜像过去。不要在 vault 里生成：两边时间戳会不同，下一轮就变成假冲突
 - `--vault` 只需第一次带，之后记在库的 `.config.json` 里；目标目录变了才需要重新指定
 - **孤儿文件**：库里改名或删掉的文件，vault 里不会自动消失，会在返回的 `orphans` 里列出。加 `--prune` 才会删除（删集合永远需要显式开关）。改名之后发布，务必带 `--prune`，否则 Obsidian 里会同时出现新旧两份
 - **冲突保护**：vault 里的同名文件若比库里新（用户在 Obsidian 里改过），跳过并在 `conflicts` 里列出。这种情况**必须口头告诉用户哪几个文件没覆盖**，并问是保留 Obsidian 版本还是以库为准
@@ -147,7 +156,8 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py init "<库目录>"
 
 ## 交付
 
-- 每完成一次收录或总结，先跑 `check`，再跑一次索引重建，然后用 `present_files` 展示**刚生成的那份文档**；新建库时额外把 `index.html` 一起展示
+- 每完成一次收录或总结，先跑 `check`，再跑 `render.py all`（网页 + 目录），然后用 `present_files` 展示**刚生成的那份文档**；新建库时额外把 `index.html` 一起展示
+- 和用户交代入口：Obsidian 里看 `00-目录.md`，手机上或发给别人看 `index.html`
 - `check` 有 `errors` 就不要交付，先修
 - 回复里给：编号 + 标题 + 一句话说明，以及下一步能做什么（「再说一次总结就出 2 号」）
 - 总结交付时把「等你确认后我入库」说出口，让用户知道现在还差一步

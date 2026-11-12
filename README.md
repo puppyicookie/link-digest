@@ -42,9 +42,12 @@ Windows 下路径是 `C:\Users\<用户名>\.workbuddy\skills\link-digest`。
 ├── 总结/        1 NotebookLM 怎么用才有效.md
 ├── 素材/        1 用 NotebookLM 搞定期末复习/
 │   └── <n> 标题/   原文.md  meta.md  media/  _source/
+├── 00-目录.md    Obsidian 入口：双链 + 每篇一句话 + 待总结提示
 ├── index.html    可离线打开的单文件阅读页
 └── .ledger.json  收录台账（编号、链接、作者、时间）
 ```
+
+两个入口，用途不同：`00-目录.md` 是 Obsidian 里的导航（双链能点、能看到哪些文章还没进总结）；`index.html` 是给别人看或手机上看的一次性网页，Obsidian 不渲染 html，所以那边用不上它。
 
 编号在库内独立递增，`文章/` 和 `总结/` 各一套，从不覆盖已有文件。可以按主题建多个库。
 
@@ -70,8 +73,8 @@ python scripts/pipeline.py status ~/文章库
 python scripts/pipeline.py check ~/文章库
 python scripts/pipeline.py check ~/文章库 --links          # 额外测原文链接是否还活着
 
-# 生成可离线阅读的索引页
-python scripts/render.py index ~/文章库
+# 生成可离线阅读的索引页，以及 Obsidian 入口笔记 00-目录.md
+python scripts/render.py all ~/文章库
 
 # 发布到 Obsidian（带冲突保护；--prune 清掉改名留下的残留）
 python scripts/pipeline.py publish ~/文章库 --vault ~/Obsidian/文章库 --prune
@@ -88,6 +91,16 @@ python scripts/pipeline.py publish ~/文章库 --vault ~/Obsidian/文章库 --pr
 `collect` 时只能用**原文标题**给素材目录命名，但文章标题是模型读完正文之后才定的——「期末考高速通过 纯用ai搞定复习大纲＋刷题」会变成「用 NotebookLM + Gemini 两天搞定微观经济学期末复习」。两边必然分叉。
 
 `retitle` 一条命令做完全部联动：素材目录改名、文章文件改名、frontmatter 的 `标题` 与 `素材目录`、正文里全部 `![[素材/…]]` 图片嵌入、台账记录。返回的 `broken_images` 必须为空。
+
+## 在 Obsidian 里怎么用
+
+把库目录作为 vault 打开，钉住 `00-目录.md` 就行。它每次自动生成，包含：
+
+- 每份总结的链接和覆盖范围
+- 每篇文章的双链、平台/作者/时间，以及一句话摘要
+- 文末 `## 待总结`：哪些文章还没进任何一份总结
+
+`publish` 会在库里重新生成这份目录再镜像到 vault，所以 Obsidian 里看到的始终和库一致。目录只写日期不写时刻，同一天重复生成结果完全相同——这样同步不会因为时间戳产生假改动。
 
 ## 三条硬规则
 

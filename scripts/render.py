@@ -200,11 +200,129 @@ def card(it, kind):
             % (it['idx'], esc(title), esc(meta), md2html(it['body'])))
 
 
+def read_doc(p):
+    """返回 (frontmatter, 去掉 H1 的正文, H1)。"""
+    text = open(p, encoding='utf-8').read()
+    fm, body = strip_fm(text)
+    h1 = ''
+    m = re.match(r'^\s*#\s+(.+?)\s*\n', body)
+    if m:
+        h1 = m.group(1)
+        body = body[m.end():]
+    return fm, body, h1
+
+
+def one_line(body, limit=70):
+    """一句话摘要：优先取 `## 一句话摘要` 下首段，否则取正文首段。"""
+    m = re.search(r'(?ms)^##\s*一句话摘要\s*\n(.*?)(?=\n##\s|\Z)', body)
+    seg = m.group(1) if m else body
+    for para in re.split(r'\n\s*\n', seg.strip()):
+        s = ' '.join(x.strip() for x in para.splitlines() if x.strip())
+        s = re.sub(r'^[-*>\s]+', '', s).strip()
+        if not s:
+            continue
+        if len(s) <= limit:
+            return s
+        head = s[:limit]
+        cut = max(head.rfind(x) for x in '。！？；')
+        if cut >= limit * 0.6:
+            return head[:cut + 1]          # 停在句末，读起来是完整的
+        if head[-1].isascii() and head[-1].isalnum():
+            sp = head.rfind(' ')           # 别把英文单词切一半
+            if sp >= limit * 0.5:
+                head = head[:sp]
+        return head.rstrip('，、, ') + '…'
+    return ''
+
+
+def wiki(root, p, label):
+    """Obsidian 双链；文件名含 # | [ ] 时降级为纯文本，避免链接语法被破坏。"""
+    rel = os.path.relpath(p, root).replace('\\', '/')
+    if rel.lower().endswith('.md'):
+        rel = rel[:-3]
+    if re.search(r'[#|\[\]]', rel):
+        return label
+    return '[[%s|%s]]' % (rel, label) if label != rel else '[[%s]]' % rel
+
+
+def build_moc(root):
+    """生成 Obsidian 入口笔记 00-目录.md：双链 + 按篇一句话 + 待总结提示。"""
+    arts, sums = collect(os.path.join(root, '文章')), collect(os.path.join(root, '总结'))
+    covered = set()
+    sum_items = []
+    for s in sums:
+        fm, body, h1 = read_doc(s['file'])
+        title = h1 or ('总结 %s' % s['idx'])
+        # H1 里常带「（覆盖文章 1—2）」，覆盖范围单独一列展示，标题里去掉避免重复
+        title = re.sub(r'\s*[（(]覆盖文章[^）)]*[）)]\s*$', '', title).strip() or title
+        nums = [int(x) for x in re.findall(r'\d+', fm.get('覆盖文章', ''))]
+        covered.update(nums)
+        rng = '覆盖文章 %s' % ('、'.join(map(str, nums)) if nums else '未标注')
+        sum_items.append((s['idx'], title, rng, s['file']))
+
+    art_items = []
+    for a in arts:
+        fm, body, h1 = read_doc(a['file'])
+        title = fm.get('标题') or h1 or ('文章 %s' % a['idx'])
+        meta = ' · '.join(x for x in [fm.get('来源平台'), fm.get('原作者'),
+                                      fm.get('发布时间')] if x)
+        tags = [t for t in re.split(r'[,，\s]+', fm.get('标签', '')) if t]
+        art_items.append((a['idx'], title, meta, one_line(body),
+                          ['#' + t.lstrip('#') for t in tags], a['file']))
+
+    pending = [a[0] for a in art_items if a[0] not in covered]
+    ts = __import__('datetime').datetime.now().astimezone().isoformat(timespec='seconds')
+    day = ts[:10]
+
+    # 只写日期不写时刻：同一天内重复生成应得到完全相同的内容，
+    # 否则每次 publish 都会因为时间戳不同而多复制一个文件、也是假改动
+    L = ['---', '类型: 目录', '文章数: %d' % len(arts), '总结数: %d' % len(sums),
+         '更新时间: %s' % day, '---', '', '# %s' % os.path.basename(root.rstrip('\\/')), '']
+    L.append('%d 篇文章 · %d 份总结 · 最后更新 %s' % (len(arts), len(sums), day))
+
+    L += ['', '## 总结', '']
+    if sum_items:
+        for idx, title, rng, f in sum_items:
+            L.append('- %s —— %s' % (wiki(root, f, '%d · %s' % (idx, title)), rng))
+    else:
+        L.append('还没有总结。')
+
+    L += ['', '## 文章', '']
+    if art_items:
+        for idx, title, meta, summary, tags, f in art_items:
+            L.append('%d. %s' % (idx, wiki(root, f, title)))
+            line = '   ' + (meta or '')
+            if summary:
+                line += (' ｜ ' if meta else '   ') + summary
+            L.append(line.rstrip())
+            if tags:
+                L.append('   ' + ' '.join(tags))
+    else:
+        L.append('还没有文章。')
+
+    if pending:
+        L += ['', '## 待总结', '',
+              '这些文章还没进任何一份总结：%s' % '、'.join(map(str, pending))]
+
+    out = os.path.join(root, '00-目录.md')
+    with open(out, 'w', encoding='utf-8', newline='\n') as fh:
+        fh.write('\n'.join(L).rstrip() + '\n')
+    return out, len(arts), len(sums), pending
+
+
 def main():
-    if len(sys.argv) < 3 or sys.argv[1] != 'index':
-        print('用法: python render.py index <库目录>')
+    if len(sys.argv) < 3 or sys.argv[1] not in ('index', 'moc', 'all'):
+        print('用法: python render.py index|moc|all <库目录>')
         sys.exit(1)
-    root = os.path.abspath(sys.argv[2])
+    mode, root = sys.argv[1], os.path.abspath(sys.argv[2])
+
+    if mode in ('moc', 'all'):
+        moc, na, ns, pending = build_moc(root)
+        print(json.dumps({'ok': True, 'moc': moc, 'articles': na, 'summaries': ns,
+                          'pending_articles': pending}, ensure_ascii=False))
+        if mode == 'moc':
+            return
+
     arts = collect(os.path.join(root, '文章'))
     sums = collect(os.path.join(root, '总结'))
 
