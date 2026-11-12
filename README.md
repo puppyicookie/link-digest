@@ -30,7 +30,7 @@ Windows 下路径是 `C:\Users\<用户名>\.workbuddy\skills\link-digest`。
 |---|---|
 | Python 3.9+ | 只用标准库，无需 pip 安装 |
 | curl | 抓页面与下载图片 |
-| [media-extract](https://github.com/) 技能 | 可选。小红书/B站/小宇宙的提取器复用它的脚本；缺失时这三类链接会报错，公众号有内置兜底 |
+| [media-extract](https://www.workbuddy.cn) 技能 | 可选。小红书/B站/小宇宙的提取器复用它的脚本；缺失时这三类链接会报错，公众号有内置兜底 |
 
 ## 目录结构
 
