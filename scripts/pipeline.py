@@ -537,6 +537,19 @@ def cmd_check(args):
         if n not in led_idxs:
             warns.append('文章 %d 不在台账里（手写的？）' % n)
 
+    # 媒体体检：0 字节 = 下载失败留下的空壳（2026-11-13 实测：小红书图片 CDN
+    # 偶发整批 403，提取器没重试，8 张全 0 字节还正常走完了收录流程）。
+    for n in arts:
+        mdir = material_dir(project, n)
+        med = os.path.join(mdir, 'media') if mdir else None
+        if not med or not os.path.isdir(med):
+            continue
+        for f in sorted(os.listdir(med)):
+            p = os.path.join(med, f)
+            if os.path.isfile(p) and os.path.getsize(p) < 1000:
+                errors.append('素材 %d 的 media/%s 只有 %d 字节（下载失败空壳），'
+                              '跑 repair-media %s 修复' % (n, f, os.path.getsize(p), n))
+
     covered = set()
     for m_ in sums:
         sp = numbered_file(os.path.join(project, '总结'), m_)
@@ -591,6 +604,116 @@ def cmd_check(args):
          'errors': errors, 'warnings': warns,
          'vault': target or '', 'vault_orphans': orphans, 'dead_links': dead})
 
+
+
+def reverse_platform(alias):
+    return {v: k for k, v in PLATFORM_ALIAS.items()}.get(alias, alias)
+
+
+def cmd_repair_media(args):
+    """重抓指定编号的坏媒体：重跑提取器，只覆盖 0 字节/缺失的文件，好的不动。
+
+    背景（2026-11-13 实测）：小红书图片 CDN 的签名直链会偶发整批 403，
+    当时下载失败留下一批 0 字节空壳，且 URL 带时间戳签名、过期后无法原地重下，
+    必须重新打开笔记页拿新鲜直链。本命令就是「重新打开页面 → 重新下载」的固化。
+    """
+    project, idx = None, None
+    for a in args:
+        if a.startswith('--'):
+            continue
+        if project is None:
+            project = a
+        elif idx is None:
+            try:
+                idx = int(a)
+            except ValueError:
+                fail('编号必须是数字: %s' % a)
+    if not project or idx is None:
+        fail('用法: repair-media <项目目录> <编号>')
+
+    project = os.path.abspath(project)
+    mdir = material_dir(project, idx)
+    if not mdir:
+        fail('素材 %d 不存在' % idx)
+    med = os.path.join(mdir, 'media')
+    os.makedirs(med, exist_ok=True)
+
+    entry = next((e for e in load_ledger(project) if e.get('idx') == idx), None)
+    if not entry or not entry.get('url'):
+        fail('台账里没有编号 %d 的原文链接，无法重抓' % idx)
+
+    bad = sorted(f for f in os.listdir(med)
+                 if os.path.isfile(os.path.join(med, f))
+                 and os.path.getsize(os.path.join(med, f)) < 1000)
+    if not bad:
+        out({'ok': True, 'article_idx': idx, 'fixed': [], 'still_broken': [],
+             'note': '没有坏文件，无需修复'})
+
+    incoming = os.path.join(project, '.incoming',
+                            datetime.datetime.now().strftime('%Y%m%d%H%M%S%f'))
+    os.makedirs(incoming, exist_ok=True)
+    platform = reverse_platform(entry.get('platform') or '')
+    produced, err = run_extractor(platform, entry['url'], incoming)
+    if not produced:
+        shutil.rmtree(incoming, ignore_errors=True)
+        fail('重新提取失败：%s' % err)
+
+    new_med = os.path.join(produced, 'media')
+    fixed, still_broken = [], []
+    for f in bad:
+        src = os.path.join(new_med, f)
+        dst = os.path.join(med, f)
+        if os.path.isfile(src) and os.path.getsize(src) > 1000:
+            shutil.copy2(src, dst)
+            fixed.append({'file': f, 'bytes': os.path.getsize(dst)})
+        else:
+            still_broken.append({'file': f,
+                                 'new_http': None, 'note': '重抓后仍未获得有效文件'})
+
+    # 同步 _source/meta.json 的图片记录与 meta.md 的「图片：x/y」行，
+    # 以磁盘为准逐张重算，别信提取器自己报的数。
+    meta_json = os.path.join(mdir, '_source', 'meta.json')
+    ok_cnt, total = 0, 0
+    if os.path.exists(meta_json):
+        try:
+            mj = json.load(open(meta_json, encoding='utf-8'))
+        except Exception:
+            mj = None
+        if mj is not None:
+            new_mj_path = os.path.join(produced, '_source', 'meta.json')
+            new_recs = {}
+            if os.path.exists(new_mj_path):
+                try:
+                    new_recs = {r.get('file'): r for r in json.load(
+                        open(new_mj_path, encoding='utf-8')).get('images', [])}
+                except Exception:
+                    new_recs = {}
+            recs = mj.get('images') or []
+            for r in recs:
+                f = r.get('file')
+                p = os.path.join(med, f) if f else None
+                sz = os.path.getsize(p) if p and os.path.isfile(p) else 0
+                r['bytes'] = sz
+                r['http'] = '200' if sz > 1000 else (new_recs.get(f, {}).get('http') or r.get('http'))
+                total += 1
+                ok_cnt += 1 if sz > 1000 else 0
+            mj['image_downloaded'] = ok_cnt
+            with open(meta_json, 'w', encoding='utf-8', newline='') as fh:
+                json.dump(mj, fh, ensure_ascii=False, indent=2)
+    meta_md = os.path.join(mdir, 'meta.md')
+    if os.path.exists(meta_md) and total:
+        txt = open(meta_md, encoding='utf-8').read()
+        txt = re.sub(r'图片：\d+/\d+', '图片：%d/%d' % (ok_cnt, total), txt)
+        with open(meta_md, 'w', encoding='utf-8', newline='') as fh:
+            fh.write(txt)
+
+    shutil.rmtree(incoming, ignore_errors=True)
+    if still_broken:
+        fail('修复了 %d 个，仍有 %d 个失败：%s' % (len(fixed), len(still_broken),
+             ', '.join(b['file'] for b in still_broken)),
+             fixed=fixed, still_broken=still_broken)
+    out({'ok': True, 'article_idx': idx, 'fixed': fixed,
+         'still_broken': [], 'images_ok': '%d/%d' % (ok_cnt, total) if total else None})
 
 
 def node_bin():
@@ -1017,10 +1140,11 @@ def main():
     handler = {'init': cmd_init, 'collect': cmd_collect, 'retitle': cmd_retitle,
                'next': cmd_next, 'status': cmd_status, 'check': cmd_check,
                'comments': cmd_comments, 'login': cmd_login,
-               'libraries': cmd_libraries, 'publish': cmd_publish}.get(cmd)
+               'libraries': cmd_libraries, 'publish': cmd_publish,
+               'repair-media': cmd_repair_media}.get(cmd)
     if not handler:
-        fail('未知子命令: %s（可用 init/collect/retitle/next/status/check/comments/login/libraries/publish）'
-             % cmd)
+        fail('未知子命令: %s（可用 init/collect/retitle/next/status/check/'
+             'comments/login/libraries/publish/repair-media）' % cmd)
     handler(args)
 
 

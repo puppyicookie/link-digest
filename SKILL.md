@@ -97,12 +97,21 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py check "<库目录>" -
 - 编号是否跳号
 - frontmatter 必填字段、正文首行 H1
 - 图片引用是否都指向真实文件
+- **media/ 下有没有 0 字节的坏图**（下载失败留下的空壳，Obsidian 里显示裂图）
 - 文章文件名与素材目录名的标题片段是否一致
 - 台账条目与磁盘是否对得上
 - 总结声称覆盖的文章是否存在、哪些文章还没进任何总结
 - vault 里有没有库里已不存在的孤儿文件
 
 **每次收录完、每次发布前跑一次。** `errors` 非空就不要交付。`uncovered_articles` 非空时顺口告诉用户「3、4 号还没进总结」。
+
+check 报「0 字节空壳」时用这条修（重开笔记页拿新鲜签名直链重下，只覆盖坏文件，好的不动）：
+
+```bash
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py repair-media "<库目录>" <编号>
+```
+
+背景：小红书图片 CDN 的直链带时间戳签名，会偶发整批 403，且过期后无法原地重下。`repair-media` 就是「重新打开页面 → 重新下载」的固化，修完自动同步 `meta.md` 的图片计数。0 字节文件必须当 errors 处理，不能只给 warning——用户在 Obsidian 里看到的是裂图。
 
 ### 五、生成索引与目录
 
