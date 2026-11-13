@@ -565,6 +565,8 @@ def cmd_check(args):
 
     cfg = load_cfg(project)
     target = vault or cfg.get('vault')
+    if target and cfg.get('folder'):
+        target = os.path.join(target, *str(cfg['folder']).split('/'))
     orphans = []
     if target and os.path.isdir(target):
         lib_rel = set(rel for rel, _ in iter_payload(project))
@@ -1012,12 +1014,16 @@ def cmd_publish(args):
 
     冲突保护：vault 里的同名文件若比库里新（你手动改过），跳过并报告，绝不覆盖。
     """
-    project, vault, dry, prune = None, None, False, False
+    project, vault, folder, dry, prune = None, None, None, False, False
     i = 0
     while i < len(args):
         a = args[i]
         if a == '--vault':
             vault = args[i + 1] if i + 1 < len(args) else None
+            i += 2
+            continue
+        if a == '--folder':
+            folder = args[i + 1] if i + 1 < len(args) else None
             i += 2
             continue
         if a == '--dry-run':
@@ -1028,21 +1034,33 @@ def cmd_publish(args):
             project = a
         i += 1
     if not project:
-        fail('用法: publish <项目目录> --vault <Obsidian 目标目录> [--prune] [--dry-run]')
+        fail('用法: publish <项目目录> --vault <Obsidian 目标目录> '
+             '[--folder 主题名] [--prune] [--dry-run]')
     project = os.path.abspath(project)
     ensure_project(project)
 
     cfg = load_cfg(project)
-    target = os.path.abspath(vault or cfg.get('vault') or '')
-    if not vault and not cfg.get('vault'):
+    base = vault or cfg.get('vault') or ''
+    if not base:
         fail('未设置 Obsidian 目标目录，首次使用请带 --vault <路径>')
+    base = os.path.abspath(base)
     if not vault:
-        target = os.path.abspath(cfg['vault'])
+        base = os.path.abspath(cfg['vault'])
+    # 主题文件夹：--folder 指定或沿用上次；目标 = vault/<主题>/，
+    # 文章、总结、素材全部收进去，不存在就新建。一个 vault 可以放多个主题互不干扰。
+    folder = folder or cfg.get('folder') or ''
+    if folder:
+        folder = folder.strip().strip('\\/').replace('\\', '/')
+        if not folder or folder.startswith('.') or ':' in folder:
+            fail('非法的主题文件夹名: %r' % folder)
+    target = os.path.join(base, *folder.split('/')) if folder else base
 
     if target == project:
         fail('vault 目录与库目录相同，无需发布')
     if target.startswith(project + os.sep):
         fail('vault 目录不能放在库目录内部')
+    if not dry and not os.path.isdir(target):
+        os.makedirs(target, exist_ok=True)
 
     render = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'render.py')
     if os.path.exists(render) and not dry:
@@ -1100,14 +1118,15 @@ def cmd_publish(args):
                             pass
 
     if not dry:
-        cfg['vault'] = target
+        cfg['vault'] = base
+        cfg['folder'] = folder
         cfg['last_publish'] = now()
         save_cfg(project, cfg)
         if os.path.exists(render):
             subprocess.run([sys.executable, render, 'index', target],
                            capture_output=True, text=True)
 
-    out({'ok': True, 'dry_run': dry, 'vault': target,
+    out({'ok': True, 'dry_run': dry, 'vault': target, 'folder': folder,
          'copied': copied, 'unchanged': same, 'conflicts': conflicts,
          'conflict_note': '这些文件在 Obsidian 里被改过，未覆盖' if conflicts else '',
          'orphans': [r for r in orphans if r not in pruned],
