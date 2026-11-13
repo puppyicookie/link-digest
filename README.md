@@ -78,9 +78,24 @@ python scripts/render.py all ~/文章库
 
 # 发布到 Obsidian（带冲突保护；--prune 清掉改名留下的残留）
 python scripts/pipeline.py publish ~/文章库 --vault ~/Obsidian/文章库 --prune
+
+# 抓评论区（仅小红书，可选）：一次扫码登录，之后复用登录态
+python scripts/pipeline.py login
+python scripts/pipeline.py comments ~/文章库 1
 ```
 
 脚本只负责采集、落盘、编号。正文文章和总结由模型按 `references/` 里的规范撰写——这部分是判断和写作，硬编码不出来。
+
+## 评论区怎么抓的
+
+用的是 Chrome DevTools Protocol：启动一个带**独立配置目录**的 Chrome（不碰你日常浏览器的资料），打开笔记页，像人一样往下滚、点开每条「展开 N 条回复」，再把渲染出来的评论读出来。不调未公开接口、不算签名、不装第三方库，只需要 Node.js 22+。
+
+两个坑都踩过，改脚本前先看这两条：
+
+1. **只滚内层容器不够**——`.note-scroller` 和 `window` 都要滚，否则主评论永远停在前 10 条
+2. **每条「展开 N 条回复」都必须点**，否则回复一条都拿不到
+
+产物：`素材/<n 标题>/comments.json`（结构化）与 `评论.md`（按点赞降序、回复挂主评论下）。返回里 `partial: true` 表示抓到的少于页面标注总数，这种情况必须把两个数字都说出来。
 
 ## 判重按内容 ID，不按链接字符串
 

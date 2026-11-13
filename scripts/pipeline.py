@@ -9,6 +9,8 @@ link-digest 工作区管理 + 内容采集。
     next    <项目目录> --type article|summary   输出下一个可用编号
     status  <项目目录>                     输出当前收录情况
     check   <项目目录> [--vault <路径>] [--links]   体检：图片、编号、台账、覆盖范围、孤儿文件
+    comments <项目目录> <编号> [--force] [--top N]  抓小红书评论区 → 素材/<n>/comments.json + 评论.md
+    login   [--timeout 秒]                打开浏览器等扫码登录小红书（登录态存在独立配置目录）
     libraries <父目录>                    列出该目录下的所有库
     publish <项目目录> --vault <路径> [--prune] [--dry-run]  镜像到 Obsidian（含冲突保护）
 
@@ -591,6 +593,130 @@ def cmd_check(args):
 
 
 
+def node_bin():
+    for name in ('node', 'node.exe'):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def default_profile():
+    return os.path.join(os.path.expanduser('~'), '.workbuddy',
+                        'browser-profile', 'xhs')
+
+
+def render_comments_md(idx, data, rows):
+    """把评论渲染成可读 Markdown：主评论按赞数降序，回复按父级序号精确挂载。"""
+    parents = [r for r in rows if not r.get('is_reply')]
+    kids = {}
+    for r in rows:
+        if r.get('is_reply'):
+            kids.setdefault(r.get('parent_idx', -1), []).append(r)
+    parents.sort(key=lambda r: -(r.get('likes') or 0))
+
+    fetched = (data.get('fetched_at') or '')[:19].replace('T', ' ')
+    L = ['---', '类型: 评论区', '原文标题: %s' % (data.get('title') or ''),
+         '评论总数: %d' % len(rows),
+         '主评论数: %d' % len(parents),
+         '页面标注总数: %s' % (data.get('total_label') or '未知'),
+         '抓取时间: %s' % fetched, '---', '',
+         '# 评论区 · %s' % (data.get('title') or ('文章 %d' % idx)), '',
+         '共抓取 %d 条（主评论 %d 条、回复 %d 条），按点赞数从高到低排列。'
+         % (len(rows), len(parents), len(rows) - len(parents)), '']
+    if data.get('login_wall'):
+        L += ['> 抓取时遇到登录墙（%s），数量可能不全。' % data['login_wall'], '']
+
+    for i, p in enumerate(parents, 1):
+        like = p.get('like') or ''
+        like = '' if like in ('赞', '') else ' · %s 赞' % like
+        meta = ' · '.join(x for x in [p.get('author'), p.get('location'), p.get('date')] if x)
+        L.append('%d. **%s**%s  ' % (i, meta, like))
+        L.append('   %s' % (p.get('text') or '').replace('\n', ' '))
+        for k in kids.get(p.get('parent_idx', -1), []):
+            kmeta = ' · '.join(x for x in [k.get('author'), k.get('date')] if x)
+            L.append('   - ↳ %s：%s' % (kmeta, (k.get('text') or '').replace('\n', ' ')))
+        L.append('')
+    return '\n'.join(L).rstrip() + '\n'
+
+
+def cmd_comments(args):
+    if len(args) < 2:
+        fail('用法: comments <项目目录> <编号> [--force] [--top N]')
+    project = os.path.abspath(args[0])
+    try:
+        idx = int(args[1])
+    except ValueError:
+        fail('编号必须是数字: %s' % args[1])
+    top = None
+    if '--top' in args:
+        try:
+            top = int(args[args.index('--top') + 1])
+        except (IndexError, ValueError):
+            fail('--top 后面要跟数字')
+    force = '--force' in args
+
+    entry = None
+    for e in load_ledger(project):
+        if e.get('idx') == idx:
+            entry = e
+            break
+    if not entry:
+        fail('台账里没有编号 %d' % idx)
+
+    url = entry.get('url') or ''
+    if not re.search(r'(xiaohongshu\.com|xhslink\.com)', url):
+        fail('评论区抓取目前只支持小红书，这条来自 %s' % (entry.get('platform') or '未知平台'))
+
+    mdir = material_dir(project, idx)
+    if not mdir:
+        fail('找不到编号 %d 的素材目录' % idx)
+    out_json = os.path.join(mdir, 'comments.json')
+
+    cached = ''
+    if os.path.exists(out_json) and not force:
+        data = json.load(open(out_json, encoding='utf-8'))
+        cached = '已有 comments.json，跳过抓取（--force 重抓）'
+    else:
+        node = node_bin()
+        if not node:
+            fail('抓评论区需要 Node.js 22+，当前找不到 node')
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xhs_comments.js')
+        if not os.path.exists(script):
+            fail('缺少 xhs_comments.js')
+        cfg = load_cfg(project)
+        profile = cfg.get('browser_profile') or default_profile()
+        r = subprocess.run([node, script, url, out_json, '--profile', profile],
+                           capture_output=True, text=True,
+                           encoding='utf-8', errors='replace')
+        if r.returncode != 0 or not os.path.exists(out_json):
+            tail = ((r.stderr or '') + (r.stdout or '')).strip()[-400:]
+            fail('抓取失败：%s' % (tail or '未知错误'), need_login='未登录' in tail)
+        data = json.load(open(out_json, encoding='utf-8'))
+        if not cfg.get('browser_profile'):
+            cfg['browser_profile'] = profile
+            save_cfg(project, cfg)
+
+    rows = data.get('rows') or []
+    md = render_comments_md(idx, data, rows)
+    md_path = os.path.join(mdir, '评论.md')
+    with open(md_path, 'w', encoding='utf-8', newline='\n') as f:
+        f.write(md)
+
+    total = data.get('total_label') or ''
+    partial = False
+    if total.isdigit() and rows:
+        partial = len(rows) < int(total)
+    out({'ok': True, 'article_idx': idx, 'collected': len(rows),
+         'top_level': len([r for r in rows if not r.get('is_reply')]),
+         'replies': len([r for r in rows if r.get('is_reply')]),
+         'total_label': total, 'partial': partial,
+         'login_wall': data.get('login_wall') or '',
+         'json': out_json, 'markdown': md_path,
+         'cached': cached,
+         'note': ('抓到 %d 条，页面标注 %s 条，可能不全' % (len(rows), total)) if partial else ''})
+
+
 def cmd_collect(args):
     if len(args) < 2:
         fail('用法: collect <项目目录> <链接>')
@@ -867,6 +993,22 @@ def cmd_publish(args):
                          '，加 --prune 可清掉' % len(orphans)) if orphans and not prune else ''})
 
 
+def cmd_login(args):
+    node = node_bin()
+    if not node:
+        fail('需要 Node.js 22+')
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xhs_login.js')
+    if not os.path.exists(script):
+        fail('缺少 xhs_login.js')
+    r = subprocess.run([node, script], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    ok = 'LOGIN_OK' in (r.stdout or '')
+    out({'ok': ok,
+         'profile': default_profile(),
+         'log': ((r.stdout or '') + (r.stderr or '')).strip()[-600:],
+         'note': '登录态已保存，后续抓取直接复用' if ok else '未完成登录'})
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -874,9 +1016,10 @@ def main():
     cmd, args = sys.argv[1], sys.argv[2:]
     handler = {'init': cmd_init, 'collect': cmd_collect, 'retitle': cmd_retitle,
                'next': cmd_next, 'status': cmd_status, 'check': cmd_check,
+               'comments': cmd_comments, 'login': cmd_login,
                'libraries': cmd_libraries, 'publish': cmd_publish}.get(cmd)
     if not handler:
-        fail('未知子命令: %s（可用 init/collect/retitle/next/status/check/libraries/publish）'
+        fail('未知子命令: %s（可用 init/collect/retitle/next/status/check/comments/login/libraries/publish）'
              % cmd)
     handler(args)
 

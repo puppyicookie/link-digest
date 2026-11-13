@@ -42,7 +42,7 @@ agent_created: true
 
 用户明确说了「不用审，直接入库」时，才允许收录完直接发布。
 
-## 七个动作
+## 八个动作
 
 ### 一、收录链接
 
@@ -128,7 +128,38 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py libraries "<父目录
 
 用表格回：编号 / 标题 / 平台 / 作者 / 收录时间，并说明已有几份总结、各自覆盖了哪些文章。
 
-### 七、发布到 Obsidian
+### 七、抓评论区（可选，仅小红书）
+
+用户说「带评论」「抓一下评论」「评论区也看看」时才走这一步。不说就不抓，正文链路保持不变。
+
+```bash
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py comments "<库目录>" <编号>
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py comments "<库目录>" <编号> --force   # 重抓
+```
+
+产物两份，都在 `素材/<n 标题>/` 下：
+
+- `comments.json` —— 原始结构化数据（作者、正文、日期、地点、点赞数、是否回复、父级序号）
+- `评论.md` —— 按点赞降序、回复挂在主评论下的可读版，Obsidian 里可直接看
+
+返回字段里重点看两个：`partial` 和 `login_wall`。`partial: true` 表示抓到的条数少于页面标注总数，**必须把两个数字都告诉用户**（「页面写 212 条，抓到 180 条」），不许说成抓全了。
+
+**前置条件**：需要 Node.js 22+ 和一个已登录的小红书登录态。没登录或登录过期时脚本会返回 `login_wall`，这时让用户跑一次：
+
+```bash
+python ~/.workbuddy/skills/link-digest/scripts/pipeline.py login
+```
+
+会弹出一个 Chrome 窗口（独立配置目录 `~/.workbuddy/browser-profile/xhs`，不动用户日常浏览器），用户扫码后自动关闭并保存登录态，有效期通常几周。
+
+**实现要点（改脚本前先看）**：不用签名接口、不用第三方库，走 Chrome DevTools Protocol 在真实页面里读 DOM。两个坑都必须避：
+
+1. **只滚内层容器不够**，`.note-scroller` 和 `window` 都要滚，否则主评论永远停在前 10 条
+2. **每条「展开 N 条回复」都要点**，否则回复拿不到
+
+不要改成「直接调 `/api/sns/web/v2/comment/page`」——那个接口要 `x-s` 签名，硬算等于和平台对抗，页面自己会签，借它的手最稳。
+
+### 八、发布到 Obsidian
 
 **只在用户确认之后执行。**
 
@@ -168,7 +199,9 @@ python ~/.workbuddy/skills/link-digest/scripts/pipeline.py init "<库目录>"
 - 只处理用户手动提供的链接，不做批量爬取、不遍历话题页或用户主页
 - 小红书链接必须带 `xsec_token`（App「分享→复制链接」）；纯 ID 链接大概率抓空，遇到就请用户重新复制
 - 小红书视频笔记只有文案，不做语音转写
-- 评论抓取不在本技能范围；需要评论区内容须另开浏览器控制通道
+- 评论抓取**仅小红书笔记**，且需要用户自己的登录态；其他平台暂不支持
+- 评论区只读：不点赞、不回复、不关注、不转发
+- 评论只抓页面上公开可见的内容，抓不全时如实报 `partial`，不补、不猜
 - 版权归原作者，原创内容仅作个人归档，不用于二次发布
 - 不覆盖已有文件：目标编号已存在时重新取号，绝不覆盖
 - 未经用户确认不执行 `publish`；`publish` 也绝不覆盖 Obsidian 里比库更新的文件
