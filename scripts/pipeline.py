@@ -40,6 +40,7 @@ PLATFORM_ALIAS = {
     'xiaohongshu': '小红书',
     'bilibili': 'B站',
     'xiaoyuzhou': '小宇宙',
+    'douyin': '抖音',
     'wechat': '公众号',
 }
 
@@ -123,6 +124,8 @@ def detect_platform(url):
         return 'bilibili'
     if 'xiaoyuzhoufm.com' in u:
         return 'xiaoyuzhou'
+    if 'douyin.com' in u or 'iesdouyin.com' in u:
+        return 'douyin'
     if 'mp.weixin.qq.com' in u:
         return 'wechat'
     return None
@@ -144,6 +147,7 @@ def run_extractor(platform, url, incoming):
         'xiaohongshu': 'extract_xhs.py',
         'bilibili': 'extract_bilibili.py',
         'xiaoyuzhou': 'extract_xiaoyuzhou.py',
+        'douyin': 'extract_douyin.py',
     }.get(platform)
     if not script:
         return None, 'unsupported'
@@ -295,6 +299,13 @@ def canon(url):
         m = re.search(r'/episode/([0-9a-z]+)', low)
         if m:
             return 'xyz:' + m.group(1)
+    if 'douyin.com' in low or 'iesdouyin.com' in low:
+        m = re.search(r'/(?:video|note)/(\d+)', low)
+        if m:
+            return 'dy:' + m.group(1)
+        m = re.search(r'modal_id=(\d+)', low)
+        if m:
+            return 'dy:' + m.group(1)
     if 'mp.weixin.qq.com' in low:
         from urllib.parse import urlparse, parse_qs
         q = parse_qs(urlparse(u).query)
@@ -726,9 +737,9 @@ def node_bin():
     return None
 
 
-def default_profile():
+def default_profile(platform='xhs'):
     return os.path.join(os.path.expanduser('~'), '.workbuddy',
-                        'browser-profile', 'xhs')
+                        'browser-profile', platform)
 
 
 def render_comments_md(idx, data, rows):
@@ -790,8 +801,13 @@ def cmd_comments(args):
         fail('台账里没有编号 %d' % idx)
 
     url = entry.get('url') or ''
-    if not re.search(r'(xiaohongshu\.com|xhslink\.com)', url):
-        fail('评论区抓取目前只支持小红书，这条来自 %s' % (entry.get('platform') or '未知平台'))
+    plat = entry.get('platform') or ''
+    is_xhs = re.search(r'(xiaohongshu\.com|xhslink\.com)', url)
+    is_bili = re.search(r'(bilibili\.com|b23\.tv)', url)
+    if not (is_xhs or is_bili):
+        fail('评论区抓取目前支持小红书、B站，这条来自 %s' % (plat or '未知平台'))
+    platform_key = 'xhs' if is_xhs else 'bili'
+    script_name = 'xhs_comments.js' if is_xhs else 'bili_comments.js'
 
     mdir = material_dir(project, idx)
     if not mdir:
@@ -806,20 +822,27 @@ def cmd_comments(args):
         node = node_bin()
         if not node:
             fail('抓评论区需要 Node.js 22+，当前找不到 node')
-        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xhs_comments.js')
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), script_name)
         if not os.path.exists(script):
-            fail('缺少 xhs_comments.js')
+            fail('缺少 %s' % script_name)
         cfg = load_cfg(project)
-        profile = cfg.get('browser_profile') or default_profile()
-        r = subprocess.run([node, script, url, out_json, '--profile', profile],
-                           capture_output=True, text=True,
+        profile_key = 'browser_profile_%s' % platform_key
+        profile = cfg.get(profile_key) or default_profile(platform_key)
+        cmd = [node, script, url, out_json]
+        if is_xhs:
+            cmd += ['--profile', profile]
+        else:
+            cmd += ['--profile', profile]
+            if top:
+                cmd += ['--max', str(top)]
+        r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding='utf-8', errors='replace')
         if r.returncode != 0 or not os.path.exists(out_json):
             tail = ((r.stderr or '') + (r.stdout or '')).strip()[-400:]
             fail('抓取失败：%s' % (tail or '未知错误'), need_login='未登录' in tail)
         data = json.load(open(out_json, encoding='utf-8'))
-        if not cfg.get('browser_profile'):
-            cfg['browser_profile'] = profile
+        if not cfg.get(profile_key):
+            cfg[profile_key] = profile
             save_cfg(project, cfg)
 
     rows = data.get('rows') or []
@@ -832,14 +855,22 @@ def cmd_comments(args):
     partial = False
     if total.isdigit() and rows:
         partial = len(rows) < int(total)
+    wall = data.get('login_wall') or ''
+    note = ''
+    if partial:
+        note = '抓到 %d 条，页面标注 %s 条，可能不全' % (len(rows), total)
+    if wall:
+        note = (note + '；' if note else '') + \
+            ('需要登录：运行 login %s 扫码，然后 comments <库> %d --force 重抓'
+             % (platform_key, idx))
     out({'ok': True, 'article_idx': idx, 'collected': len(rows),
          'top_level': len([r for r in rows if not r.get('is_reply')]),
          'replies': len([r for r in rows if r.get('is_reply')]),
          'total_label': total, 'partial': partial,
-         'login_wall': data.get('login_wall') or '',
+         'login_wall': wall, 'platform': platform_key,
          'json': out_json, 'markdown': md_path,
          'cached': cached,
-         'note': ('抓到 %d 条，页面标注 %s 条，可能不全' % (len(rows), total)) if partial else ''})
+         'note': note})
 
 
 def cmd_collect(args):
@@ -1139,14 +1170,25 @@ def cmd_login(args):
     node = node_bin()
     if not node:
         fail('需要 Node.js 22+')
-    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xhs_login.js')
+    platform = next((a for a in args if not a.startswith('--')), 'xhs')
+    if platform in ('xhs', 'xiaohongshu'):
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xhs_login.js')
+        profile = default_profile('xhs')
+        cmd = [node, script]
+    elif platform in ('bili', 'bilibili', 'douyin'):
+        key = 'bili' if platform in ('bili', 'bilibili') else 'douyin'
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'login.js')
+        profile = default_profile(key)
+        cmd = [node, script, key]
+    else:
+        fail('未知平台 %r（支持 xhs / bili / douyin）' % platform)
     if not os.path.exists(script):
-        fail('缺少 xhs_login.js')
-    r = subprocess.run([node, script], capture_output=True, text=True,
+        fail('缺少 %s' % os.path.basename(script))
+    r = subprocess.run(cmd, capture_output=True, text=True,
                        encoding='utf-8', errors='replace')
     ok = 'LOGIN_OK' in (r.stdout or '')
-    out({'ok': ok,
-         'profile': default_profile(),
+    out({'ok': ok, 'platform': platform,
+         'profile': profile,
          'log': ((r.stdout or '') + (r.stderr or '')).strip()[-600:],
          'note': '登录态已保存，后续抓取直接复用' if ok else '未完成登录'})
 
