@@ -466,7 +466,7 @@ def cmd_retitle(args):
     if mdir and os.path.isdir(os.path.join(mdir, 'media')):
         imgs = len([f for f in os.listdir(os.path.join(mdir, 'media'))
                     if os.path.isfile(os.path.join(mdir, 'media', f))])
-    broken = [r for r in re.findall(r'!\[\[([^\]|]+)', new_text)
+    broken = [r for r in re.findall(r'!\[\[([^\]|]+)', strip_inline_code(new_text))
               if not os.path.exists(os.path.join(project, *r.strip().split('/')))]
     out({'ok': True, 'article_idx': idx, 'title': title, 'slug': slug,
          'article': new_art, 'material_dir': mdir or '',
@@ -524,6 +524,7 @@ def cmd_check(args):
                              % (a_slug, d_slug))
             if not os.path.exists(os.path.join(mdir, '原文.md')):
                 warns.append('素材 %d 缺 原文.md' % n)
+        text = strip_inline_code(text)
         refs = re.findall(r'!\[\[([^\]|]+)', text) + \
             re.findall(r'!\[[^\]]*\]\(([^)]+)\)', text)
         for ref in refs:
@@ -727,6 +728,12 @@ def cmd_repair_media(args):
              fixed=fixed, still_broken=still_broken)
     out({'ok': True, 'article_idx': idx, 'fixed': fixed,
          'still_broken': [], 'images_ok': '%d/%d' % (ok_cnt, total) if total else None})
+
+
+def strip_inline_code(text):
+    """去掉行内代码片段（`...`，不跨行），防止教程正文里作为示例引用的
+    ![[...]] wiki 语法被当成真图片引用去查文件（2026-11-14 实测误报「某篇笔记」）。"""
+    return re.sub(r'`[^`\n]*`', '', text)
 
 
 def node_bin():
